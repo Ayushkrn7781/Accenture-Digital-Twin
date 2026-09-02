@@ -1,0 +1,6 @@
+vehicle_id,station_id,event_type,event_start,event_end,confirmed_by
+V-0125,FNL-08,trend,V-0125,V-0210,Quality Audit Lead
+V-0180,PNT-04,point,V-0180,V-0182,Quality Audit Lead
+V-0245,BIW-06,cross_parameter,V-0245,V-0270,Quality Audit Lead
+V-0220,PNT-08,bottleneck,V-0220,V-0420,Quality Audit Lead
+V-0300,FNL-13,bottleneck,V-0300,V-0420,Quality Audit Lead

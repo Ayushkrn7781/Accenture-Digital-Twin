@@ -1,0 +1,4 @@
+timestamp,vehicle_id,product_variant,station_id,parameter,value,cycle_time_seconds,queue_length,utilization_pct,manual_outcome
+2026-01-05T06:00:00Z,V-1001,SUV,FNL-08,torque,64.2,52.1,3,76,
+2026-01-05T06:00:00Z,V-1001,SUV,FNL-08,vision_score,96.8,52.1,3,76,
+2026-01-05T06:00:08Z,V-1001,SUV,FNL-01,,,,49.4,2,71,pass

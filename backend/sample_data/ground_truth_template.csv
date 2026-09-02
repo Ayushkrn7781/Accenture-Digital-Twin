@@ -1,0 +1,2 @@
+vehicle_id,station_id,event_type,event_start,event_end,confirmed_by
+V-1001,FNL-08,trend,V-1001,V-1001,quality-inspection
