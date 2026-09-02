@@ -211,6 +211,3 @@ Stated plainly, because the problem statement asks for assumptions to be explici
 
 ---
 
-## Demo video
-
-`[Add public demo video link here]`
