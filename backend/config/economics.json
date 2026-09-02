@@ -1,0 +1,42 @@
+{
+  "_comment": "Illustrative unit economics for a mixed-model assembly line. Directional figures, stated as assumptions - not a claim about any specific plant. Every ROI number in the dashboard and the business proposal is computed from these inputs plus MEASURED detector performance; nothing is hardcoded downstream.",
+  "currency": "USD",
+  "assumptions": {
+    "vehicles_per_year": 78000,
+    "contribution_margin_per_vehicle_usd": 1850,
+    "rework_cost_per_defect_usd": 640,
+    "scrap_rate_of_defects": 0.06,
+    "scrap_cost_per_vehicle_usd": 4200,
+    "baseline_defect_rate": 0.021,
+    "downtime_cost_per_hour_usd": 22000,
+    "investigation_cost_per_false_alarm_usd": 310,
+    "operating_hours_per_year": 3800,
+    "max_recoverable_share": 0.05,
+    "_max_recoverable_share_note": "Hard cap on recovered production as a share of annual volume, so the model cannot claim more than a plausible ceiling."
+  },
+  "actionability": {
+    "_comment": "Fraction of correctly-detected incidents the floor can actually act on, as a function of detection lead time in vehicles. Linearly interpolated; beyond the last point the value is held flat.",
+    "lead_time_vehicles": [
+      0,
+      5,
+      10,
+      20,
+      40
+    ],
+    "fraction_actionable": [
+      0.05,
+      0.35,
+      0.6,
+      0.78,
+      0.85
+    ]
+  },
+  "sensitivity": {
+    "_comment": "Fractional band applied to the two dominant assumptions when reporting a range.",
+    "band": 0.3,
+    "dominant_assumptions": [
+      "contribution_margin_per_vehicle_usd",
+      "baseline_defect_rate"
+    ]
+  }
+}

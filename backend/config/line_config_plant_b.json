@@ -1,0 +1,233 @@
+{
+  "line": {
+    "name": "Southgate Compact Line",
+    "vehicle_count": 360,
+    "scheduled_sensor_change_windows_per_year": 4,
+    "vehicles_per_shift": 24,
+    "shifts_per_week": 10
+  },
+  "thresholds": {
+    "green_abs_z": 2.0,
+    "alert_abs_z": 3.0,
+    "trend_window": 5,
+    "baseline_warmup_vehicles": 170,
+    "cross_param_abs_z": 2.5,
+    "cross_param_min_corr": 0.35,
+    "ewma_lambda": 0.2,
+    "ewma_L": 4.5,
+    "release_fraction": 0.4
+  },
+  "bottleneck": {
+    "_comment": "Values under `calibrated` are written by calibrate.py against fault-free runs. Do not hand-edit.",
+    "slope_window": 24,
+    "slope_t_crit": 3.5,
+    "cusum_k_sigma": 0.5,
+    "cusum_h_sigma": 7.75,
+    "queue_z_crit": 3.0,
+    "release_fraction": 0.4,
+    "calibrated": null
+  },
+  "product_variants": [
+    "Hatch",
+    "Crossover"
+  ],
+  "station_groups": [
+    {
+      "prefix": "BIW",
+      "count": 9,
+      "area": "Body construction",
+      "instrumented_ratio": 0.55,
+      "parameters": {
+        "force": {
+          "mean": 520,
+          "std": 24,
+          "weight": 1.1
+        },
+        "torque": {
+          "mean": 92,
+          "std": 5,
+          "weight": 1.0
+        },
+        "vibration": {
+          "mean": 3.1,
+          "std": 0.35,
+          "weight": 0.7
+        }
+      },
+      "cycle_time": 64
+    },
+    {
+      "prefix": "PNT",
+      "count": 7,
+      "area": "Paint",
+      "instrumented_ratio": 0.85,
+      "parameters": {
+        "temperature": {
+          "mean": 170,
+          "std": 1.5,
+          "weight": 1.0,
+          "model": "thermal_first_order"
+        },
+        "vision_score": {
+          "mean": 96,
+          "std": 1.5,
+          "weight": 1.2
+        },
+        "cycle_time": {
+          "mean": 46,
+          "std": 4,
+          "weight": 0.8
+        }
+      },
+      "cycle_time": 44
+    },
+    {
+      "prefix": "FNL",
+      "count": 12,
+      "area": "Final assembly",
+      "instrumented_ratio": 0.5,
+      "parameters": {
+        "torque": {
+          "mean": 64,
+          "std": 4,
+          "weight": 1.2
+        },
+        "vision_score": {
+          "mean": 97,
+          "std": 1.2,
+          "weight": 1.0
+        },
+        "cycle_time": {
+          "mean": 52,
+          "std": 5,
+          "weight": 0.9
+        }
+      },
+      "cycle_time": 49
+    }
+  ],
+  "inspection_station": "FNL-12",
+  "latent_factors": {
+    "operators": [
+      "OP-A",
+      "OP-B",
+      "OP-C"
+    ],
+    "operator_skill_sigma": 0.35,
+    "supplier_lot_size_vehicles": 30,
+    "supplier_quality_sigma": 0.3,
+    "ambient_swing_C": 3.5,
+    "ambient_period_vehicles": 190,
+    "variant_offset_sigma": 0.6
+  },
+  "injections": [
+    {
+      "id": "weld_force_trend",
+      "kind": "trend",
+      "station": "BIW-08",
+      "parameter": "force",
+      "start_vehicle": 185,
+      "end_vehicle": 260,
+      "slope_std_per_vehicle": 0.06
+    },
+    {
+      "id": "vision_spike",
+      "kind": "point",
+      "station": "FNL-10",
+      "parameter": "vision_score",
+      "vehicles": [
+        220,
+        221,
+        222
+      ],
+      "shift_std": 4.4
+    },
+    {
+      "id": "paint_bottleneck_b",
+      "kind": "bottleneck",
+      "station": "PNT-05",
+      "start_vehicle": 200,
+      "end_vehicle": 360,
+      "cycle_slope": 0.18
+    },
+    {
+      "id": "oven_fouling_b",
+      "kind": "thermal_tau_drift",
+      "station": "PNT-*",
+      "start_vehicle": 210,
+      "end_vehicle": 300,
+      "tau_end_s": 40.1
+    },
+    {
+      "id": "latent_trim_defect",
+      "kind": "latent_defect",
+      "station": "BIW-07",
+      "parameter": "torque",
+      "inspection_station": "FNL-12",
+      "start_vehicle": 250,
+      "end_vehicle": 310,
+      "shift_std": 1.2,
+      "surface_probability": 0.7,
+      "surface_lag_vehicles": 0
+    }
+  ],
+  "physics": {
+    "paint_oven": {
+      "setpoint_C": 178.0,
+      "ambient_C": 25.0,
+      "tau_s": 38.0,
+      "dwell_base_s": 30.0,
+      "dwell_step_s": 24.0,
+      "measurement_sigma_C": 1.0
+    },
+    "tau_fit_z_crit": 3.3,
+    "tau_fit_window_vehicles": 15
+  },
+  "sensor_retrofit_plan": [
+    {
+      "target_stations": [
+        "BIW-01",
+        "BIW-02",
+        "BIW-03",
+        "BIW-04"
+      ],
+      "sensor_type": "Wireless vibration puck (MEMS)",
+      "unit_cost_usd": 220,
+      "install_window": "Q1 maintenance",
+      "benefit": "Weld-gun bearing degradation, 3-5 shifts ahead"
+    },
+    {
+      "target_stations": [
+        "FNL-01",
+        "FNL-02",
+        "FNL-03",
+        "FNL-04",
+        "FNL-05",
+        "FNL-06"
+      ],
+      "sensor_type": "Clamp-on current transformer",
+      "unit_cost_usd": 150,
+      "install_window": "Q3 maintenance",
+      "benefit": "Motor load signatures without rewiring torque tools"
+    }
+  ],
+  "scalability": {
+    "config_abstraction": "Each plant supplies a line_config.json defining its station topology, sensor coverage, parameter baselines, and thresholds. No code changes required.",
+    "deployment_model": "Containerised FastAPI + React bundle. Reads OT historian via read-only SQL/OPC-UA adapter.",
+    "estimated_onboarding_weeks": 6,
+    "rollout_phases": [
+      {
+        "phase": 1,
+        "scope": "Southgate pilot line",
+        "duration_weeks": 5,
+        "cost_estimate_usd": 28000
+      },
+      {
+        "phase": 2,
+        "scope": "Southgate plant-wide",
+        "duration_weeks": 4,
+        "cost_estimate_usd": 18000
+      }
+    ]
+  }
+}

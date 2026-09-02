@@ -64,8 +64,11 @@ def load_historical_csv(blob: bytes, config: dict) -> dict[str, Any]:
         if parameter not in station["parameters"]: raise DatasetError(f"Parameter '{parameter}' is not configured for {station_id}.")
         try: numeric_value=float(value)
         except ValueError as exc: raise DatasetError(f"Invalid value for {station_id}/{parameter}.") from exc
-        spec=station["parameters"][parameter]; z=(numeric_value-spec["mean"])/spec["std"]
-        readings.append({"vehicle":vehicle,"external_vehicle_id":external,"variant":variant,"station":station_id,"parameter":parameter,"value":numeric_value,"z":round(z,3),"mean":spec["mean"],"std":spec["std"]})
+        # z-scores are NOT computed here. Uploaded data gets the same contextual
+        # (station, parameter, variant) baselines as the simulation, built by
+        # twin.build_baselines from a warm-up prefix of this very dataset.
+        readings.append({"vehicle":vehicle,"external_vehicle_id":external,"variant":variant,
+                         "station":station_id,"parameter":parameter,"value":numeric_value})
     if not readings and not operations_by_key: raise DatasetError("No usable readings or operations found.")
     # Missing operational metrics remain None instead of being silently converted to healthy values.
     operations=[]
@@ -74,7 +77,9 @@ def load_historical_csv(blob: bytes, config: dict) -> dict[str, Any]:
         op["queue"]=op["queue"] if op["queue"] is not None else 0
         op["utilization"]=op["utilization"] if op["utilization"] is not None else 0
         operations.append(op)
-    return {"stations":stations,"readings":readings,"operations":operations,"ground_truth":[],"vehicle_count":len(vehicle_sequence),"source":"uploaded CSV"}
+    return {"stations":stations,"readings":readings,"operations":operations,"ground_truth":[],
+            "vehicle_count":len(vehicle_sequence),"source":"uploaded CSV",
+            "config_name":"Uploaded historical extract"}
 
 def load_ground_truth_csv(blob: bytes, raw: dict) -> list[dict]:
     rows=_rows(blob); missing={"vehicle_id", "station_id", "event_type"}-set(rows[0])
@@ -84,10 +89,20 @@ def load_ground_truth_csv(blob: bytes, raw: dict) -> list[dict]:
     for index,row in enumerate(rows,1):
         external=row["vehicle_id"].strip(); station=row["station_id"].strip(); kind=(row["event_type"] or "anomaly").strip()
         if external not in lookup: raise DatasetError(f"Ground truth vehicle_id '{external}' does not occur in the data CSV.")
-        if station not in {s["id"] for s in raw["stations"]}: raise DatasetError(f"Ground truth station_id '{station}' is unknown.")
+        kind = kind or "anomaly"
+        known={s["id"] for s in raw["stations"]}
+        # A line-wide event (an oven, a conveyor) is recorded against a station-group
+        # wildcard such as "PNT-*" rather than one station id.
+        if station.endswith("-*"):
+            if not any(s.startswith(station[:-1]) for s in known):
+                raise DatasetError(f"Ground truth station group '{station}' matches no station.")
+        elif station not in known:
+            raise DatasetError(f"Ground truth station_id '{station}' is unknown.")
         start=lookup[external]
         # Event start/end can be vehicle IDs when supplied; otherwise the row vehicle is the event point.
         if row.get("event_start"): start=lookup.get(row["event_start"].strip(), start)
         end=lookup.get((row.get("event_end") or "").strip(), start)
-        scenarios.append({"id":f"uploaded-{index}","kind":"bottleneck" if kind=="bottleneck" else kind,"station":station,"start_vehicle":start,"end_vehicle":end,"confirmed_by":row.get("confirmed_by", "")})
+        scenarios.append({"id":f"uploaded-{index}","kind":kind,"station":station,
+                          "start_vehicle":start,"end_vehicle":end,
+                          "confirmed_by":row.get("confirmed_by", "")})
     return scenarios
