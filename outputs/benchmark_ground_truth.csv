@@ -1,6 +1,8 @@
 vehicle_id,station_id,event_type,event_start,event_end,confirmed_by
-V-0125,FNL-08,trend,V-0125,V-0210,Quality Audit Lead
-V-0180,PNT-04,point,V-0180,V-0182,Quality Audit Lead
-V-0245,BIW-06,cross_parameter,V-0245,V-0270,Quality Audit Lead
-V-0220,PNT-08,bottleneck,V-0220,V-0420,Quality Audit Lead
-V-0300,FNL-13,bottleneck,V-0300,V-0420,Quality Audit Lead
+V-0215,FNL-08,trend,V-0215,V-0300,Quality Audit Lead
+V-0250,PNT-04,point,V-0250,V-0252,Quality Audit Lead
+V-0265,BIW-06,cross_parameter,V-0265,V-0290,Quality Audit Lead
+V-0230,PNT-08,bottleneck,V-0230,V-0420,Quality Audit Lead
+V-0310,FNL-13,bottleneck,V-0310,V-0420,Quality Audit Lead
+V-0240,PNT-*,thermal_tau_drift,V-0240,V-0350,Quality Audit Lead
+V-0300,BIW-09,latent_defect,V-0300,V-0405,Quality Audit Lead

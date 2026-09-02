@@ -1,368 +1,494 @@
-"""Industrial Gradient-Boosted Decision Tree (GBDT) & XGBoost Risk Engine.
+"""Station-level defect-risk model: multi-seed training, temporal validation, SHAP.
 
-Trained on realistic industrial predictive maintenance telemetry (derived from the
-AI4I 2020 Predictive Maintenance benchmark: torque, rotational speed/cycle-time,
-thermal dissipation, tool wear drift, power overstrain, and multi-sensor SPC flags).
-Outputs calibrated vehicle-level defect probabilities (P_defect), station-level risk
-attribution, and SHAP-style feature importance weights.
+Three deliberate design choices, each fixing a way this kind of model usually lies:
+
+* **The independent unit is the event, not the row.** A single 420-vehicle run
+  contains only a handful of injected faults; thousands of autocorrelated rows drawn
+  from them cannot validate a ten-feature model. Training therefore spans many
+  independently generated lines with randomised fault station, kind, onset and
+  magnitude, so station identity carries no signal the model can memorise.
+* **Splits are by line, never by row.** A random row split on autocorrelated time
+  series leaks the answer across the boundary and inflates every metric. The demo
+  seed is held out entirely, so every figure the dashboard shows comes from data the
+  model never saw.
+* **Features are causal by construction.** ``features_at`` reads only rows at or
+  before the vehicle being scored, and the same function is used at training and at
+  serving time, so there is no train/serve skew.
 """
 from __future__ import annotations
+
+import copy
+import hashlib
+import pickle
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
+
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+
+from twin import CONFIG, analyze, simulate
+
+HORIZON = 8
+TRAIN_SEEDS = range(700, 718)
+CAL_SEEDS = range(800, 806)    # isotonic calibration fitted here
+VAL_SEEDS = range(900, 906)    # metrics reported here only - never fitted on
+DEMO_SEED = 42
 
 FEATURES = [
-    "max_abs_z",
-    "mean_abs_z",
-    "alert_count",
-    "warning_count",
-    "max_queue",
-    "mean_cycle_time",
-    "max_utilization",
-    "manual_rework_count",
-    "trend_slope_indicator",
-    "cross_param_flag"
+    "max_abs_z_10", "mean_abs_z_10", "ewma_abs", "z_slope_10",
+    "alerts_20", "warnings_20", "vehicles_since_alert",
+    "cycle_z", "cycle_cusum", "queue_z", "utilization",
+    "upstream_alerts_20", "thermal_residual_abs",
+    "manual_rework_20", "operator_idx", "lot_mean_abs_z", "variant_idx",
 ]
 
-class FastDecisionStump:
-    """High-performance decision stump for gradient boosting."""
-    def __init__(self):
-        self.feature_idx = 0
-        self.threshold = 0.0
-        self.left_val = 0.0
-        self.right_val = 0.0
-        self.gain = 0.0
+FEATURE_LABELS = {
+    "max_abs_z_10": "Peak parameter deviation (10 veh)",
+    "mean_abs_z_10": "Mean parameter deviation (10 veh)",
+    "ewma_abs": "Sustained level shift (EWMA)",
+    "z_slope_10": "Deviation trend slope",
+    "alerts_20": "Alerts at station (20 veh)",
+    "warnings_20": "Warnings at station (20 veh)",
+    "vehicles_since_alert": "Vehicles since last alert",
+    "cycle_z": "Cycle time vs baseline",
+    "cycle_cusum": "Cycle-time CUSUM",
+    "queue_z": "Buffer queue vs baseline",
+    "utilization": "Station utilization",
+    "upstream_alerts_20": "Upstream station alerts",
+    "thermal_residual_abs": "Thermal model residual",
+    "manual_rework_20": "Manual QA reworks (20 veh)",
+    "operator_idx": "Operator on shift",
+    "lot_mean_abs_z": "Incoming supplier lot quality",
+    "variant_idx": "Product variant",
+}
 
-    def fit(self, X: np.ndarray, residuals: np.ndarray):
-        n_samples, n_features = X.shape
-        best_gain = -1e9
-        
-        for f in range(n_features):
-            values = X[:, f]
-            unique_vals = np.unique(values)
-            if len(unique_vals) <= 1:
-                continue
-            thresholds = (unique_vals[:-1] + unique_vals[1:]) / 2.0
-            if len(thresholds) > 15:
-                thresholds = np.quantile(thresholds, np.linspace(0.05, 0.95, 15))
-            
-            for thresh in thresholds:
-                left_mask = values <= thresh
-                right_mask = ~left_mask
-                if not np.any(left_mask) or not np.any(right_mask):
-                    continue
-                
-                l_res = residuals[left_mask]
-                r_res = residuals[right_mask]
-                gain = np.sum(l_res)**2 / len(l_res) + np.sum(r_res)**2 / len(r_res)
-                if gain > best_gain:
-                    best_gain = gain
-                    self.feature_idx = f
-                    self.threshold = thresh
-                    self.left_val = float(np.mean(l_res))
-                    self.right_val = float(np.mean(r_res))
-                    self.gain = gain
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        mask = X[:, self.feature_idx] <= self.threshold
-        out = np.empty(len(X), dtype=float)
-        out[mask] = self.left_val
-        out[~mask] = self.right_val
-        return out
+CAUSE_FAMILY = {
+    "max_abs_z_10": "Equipment / process", "mean_abs_z_10": "Equipment / process",
+    "ewma_abs": "Equipment / process", "z_slope_10": "Equipment wear",
+    "alerts_20": "Equipment / process", "warnings_20": "Equipment / process",
+    "vehicles_since_alert": "Equipment wear",
+    "cycle_z": "Capacity / pacing", "cycle_cusum": "Capacity / pacing",
+    "queue_z": "Capacity / pacing", "utilization": "Capacity / pacing",
+    "upstream_alerts_20": "Upstream propagation",
+    "thermal_residual_abs": "Environmental / thermal",
+    "manual_rework_20": "Manual QA outcome",
+    "operator_idx": "Operator variation",
+    "lot_mean_abs_z": "Incoming part quality",
+    "variant_idx": "Product mix",
+}
 
 
-class NativeGradientBoostedClassifier:
-    """Self-contained Industrial GBDT Classifier (zero external C-extension dependencies)."""
-    def __init__(self, n_estimators: int = 35, learning_rate: float = 0.12):
-        self.n_estimators = n_estimators
-        self.lr = learning_rate
-        self.trees: list[FastDecisionStump] = []
-        self.base_pred = 0.0
-        self.feature_importances_ = np.zeros(len(FEATURES), dtype=float)
+# --------------------------------------------------------------------------
+# Causal feature extraction
+# --------------------------------------------------------------------------
 
-    def _sigmoid(self, z: np.ndarray) -> np.ndarray:
-        return 1.0 / (1.0 + np.exp(-np.clip(z, -15, 15)))
-
-    def fit(self, X: np.ndarray, y: np.ndarray):
-        n_samples = len(y)
-        pos_ratio = np.clip(np.mean(y), 1e-4, 1 - 1e-4)
-        self.base_pred = float(np.log(pos_ratio / (1 - pos_ratio)))
-        
-        raw_preds = np.full(n_samples, self.base_pred, dtype=float)
-        importances = np.zeros(X.shape[1], dtype=float)
-        
-        for _ in range(self.n_estimators):
-            probs = self._sigmoid(raw_preds)
-            residuals = y - probs
-            
-            stump = FastDecisionStump()
-            stump.fit(X, residuals)
-            
-            if stump.gain <= 0:
-                break
-                
-            pred_update = stump.predict(X)
-            raw_preds += self.lr * pred_update
-            self.trees.append(stump)
-            importances[stump.feature_idx] += stump.gain
-            
-        total_gain = np.sum(importances)
-        if total_gain > 0:
-            self.feature_importances_ = importances / total_gain
-        else:
-            self.feature_importances_ = np.ones(X.shape[1]) / X.shape[1]
-
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        raw_preds = np.full(len(X), self.base_pred, dtype=float)
-        for tree in self.trees:
-            raw_preds += self.lr * tree.predict(X)
-        probs = self._sigmoid(raw_preds)
-        return np.column_stack([1.0 - probs, probs])
+def _windows(values: np.ndarray, window: int) -> np.ndarray:
+    """Trailing windows, left-padded so index i sees only values[:i+1]."""
+    pad = np.full(window - 1, values[0] if len(values) else 0.0)
+    return sliding_window_view(np.concatenate([pad, values]), window)
 
 
-def _generate_industrial_training_prior(seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
-    """Generate industrial prior distribution based on AI4I benchmark characteristics."""
-    rng = np.random.default_rng(seed)
-    n_samples = 600
-    
-    X = np.zeros((n_samples, len(FEATURES)), dtype=float)
-    y = np.zeros(n_samples, dtype=int)
-    
-    for i in range(n_samples):
-        is_failure = rng.random() < 0.20
-        if not is_failure:
-            max_z = np.clip(rng.normal(1.9, 0.4), 0.8, 2.8)
-            mean_z = np.clip(rng.normal(0.7, 0.2), 0.2, 1.3)
-            alerts = 0
-            warnings = 0 if rng.random() < 0.80 else 1
-            queue = int(np.clip(rng.normal(2.5, 0.8), 0, 4))
-            cycle = float(np.clip(rng.normal(51.0, 2.5), 44.0, 58.0))
-            util = float(np.clip(rng.normal(68.0, 4.0), 50.0, 78.0))
-            rework = 0 if rng.random() < 0.96 else 1
-            trend = 0
-            cross = 0
-            label = 0
-        else:
-            mode = rng.choice(["tool_wear", "thermal_drift", "bottleneck_overload", "cross_fault"])
-            if mode == "tool_wear":
-                max_z = rng.normal(3.8, 0.5)
-                mean_z = rng.normal(1.9, 0.3)
-                alerts = rng.integers(1, 4)
-                warnings = rng.integers(1, 4)
-                queue = rng.integers(2, 6)
-                cycle = rng.normal(54.0, 3.0)
-                util = rng.normal(78.0, 5.0)
-                rework = rng.integers(0, 2)
-                trend = 1
-                cross = 0
-            elif mode == "thermal_drift":
-                max_z = rng.normal(4.2, 0.6)
-                mean_z = rng.normal(2.2, 0.4)
-                alerts = rng.integers(2, 5)
-                warnings = rng.integers(1, 4)
-                queue = rng.integers(3, 7)
-                cycle = rng.normal(56.0, 4.0)
-                util = rng.normal(84.0, 6.0)
-                rework = rng.integers(0, 2)
-                trend = 1
-                cross = 1 if rng.random() < 0.5 else 0
-            elif mode == "bottleneck_overload":
-                max_z = rng.normal(2.8, 0.4)
-                mean_z = rng.normal(1.6, 0.3)
-                alerts = rng.integers(0, 3)
-                warnings = rng.integers(2, 6)
-                queue = rng.integers(6, 12)
-                cycle = rng.normal(74.0, 7.0)
-                util = rng.normal(94.0, 4.0)
-                rework = rng.integers(1, 3)
-                trend = 1
-                cross = 0
-            else:
-                max_z = rng.normal(4.4, 0.7)
-                mean_z = rng.normal(2.5, 0.5)
-                alerts = rng.integers(2, 6)
-                warnings = rng.integers(1, 4)
-                queue = rng.integers(4, 9)
-                cycle = rng.normal(62.0, 5.0)
-                util = rng.normal(88.0, 5.0)
-                rework = rng.integers(1, 3)
-                trend = 0
-                cross = 1
-            label = 1
-            
-        X[i] = [max_z, mean_z, alerts, warnings, queue, cycle, util, rework, trend, cross]
-        y[i] = label
-        
-    return X, y
+def _roll_max(v: np.ndarray, w: int) -> np.ndarray:
+    return _windows(v, w).max(axis=1)
 
-def extract_features(raw: dict, analysis: dict) -> tuple[np.ndarray, list[int], dict[int, dict]]:
-    count = raw.get("vehicle_count") or max((x["vehicle"] for x in raw.get("operations", [])), default=0)
-    readings = defaultdict(list)
-    operations = defaultdict(list)
-    flags = defaultdict(list)
-    
-    for row in raw.get("readings", []): readings[row["vehicle"]].append(row)
-    for row in raw.get("operations", []): operations[row["vehicle"]].append(row)
-    for row in analysis.get("flags", []): flags[row["vehicle"]].append(row)
-    
-    matrix = []
-    metadata = {}
-    
-    for v in range(1, count + 1):
-        r = readings[v]
-        o = operations[v]
-        f = flags[v]
-        
-        abs_z = [abs(x.get("z", 0)) for x in r]
-        max_z = max(abs_z, default=0.0)
-        mean_z = float(np.mean(abs_z)) if abs_z else 0.0
-        
-        # Temporal window aggregation (current vehicle + preceding 3 vehicles)
-        window_flags = [item for k in range(max(1, v-3), v+1) for item in flags[k]]
-        alerts = sum(x.get("severity") == "alert" for x in window_flags)
-        warnings = sum(x.get("severity") == "warning" for x in window_flags)
-        trend_flags = sum(x.get("type") == "trend" for x in window_flags)
-        cross_flags = sum(x.get("type") == "cross_parameter" for x in window_flags)
-        
-        queues = [x.get("queue", 0) for x in o]
-        max_q = max(queues, default=0)
-        
-        cycles = [x.get("cycle_time", 0) for x in o]
-        mean_cycle = float(np.mean(cycles)) if cycles else 0.0
-        
-        utils = [x.get("utilization", 0) for x in o]
-        max_u = max(utils, default=0.0)
-        
-        reworks = sum(x.get("manual_outcome") in {"fail", "rework"} for x in o)
-        
-        row_feat = [
-            round(float(max_z), 3),
-            round(float(mean_z), 3),
-            alerts,
-            warnings,
-            max_q,
-            round(float(mean_cycle), 2),
-            round(float(max_u), 1),
-            reworks,
-            trend_flags,
-            cross_flags
-        ]
-        matrix.append(row_feat)
-        metadata[v] = {
-            "top_flag_station": f[0]["station"] if f else (o[0]["station"] if o else "BIW-01"),
-            "top_flag_parameter": f[0].get("parameter", "nominal") if f else "nominal"
-        }
-        
-    return np.asarray(matrix, dtype=float), list(range(1, count + 1)), metadata
 
-def compute_station_risk_matrix(raw: dict, analysis: dict, vehicle_scores: dict[int, float]) -> dict[str, dict[str, Any]]:
-    station_risks = {}
-    stations = raw.get("stations", [])
-    current_flags = analysis.get("flags", [])
-    current_bottlenecks = analysis.get("bottlenecks", [])
-    
+def _roll_mean(v: np.ndarray, w: int) -> np.ndarray:
+    return _windows(v, w).mean(axis=1)
+
+
+def _roll_sum(v: np.ndarray, w: int) -> np.ndarray:
+    return _windows(v, w).sum(axis=1)
+
+
+def _roll_slope(v: np.ndarray, w: int) -> np.ndarray:
+    """Rolling OLS slope, closed form. A polyfit per cell is ~500k fits per training
+    sweep; the closed form is the same number to machine precision."""
+    win = _windows(v, w)
+    x = np.arange(w, dtype=float)
+    xc = x - x.mean()
+    denom = float((xc ** 2).sum()) or 1.0
+    return (win - win.mean(axis=1, keepdims=True)) @ xc / denom
+
+
+def _ewma_abs(v: np.ndarray, lam: float = 0.2) -> np.ndarray:
+    out = np.empty(len(v), dtype=float)
+    e = 0.0
+    for i, x in enumerate(v):
+        e = lam * x + (1 - lam) * e
+        out[i] = abs(e)
+    return out
+
+
+def _cusum(cycles: np.ndarray, mu: float, sd: float) -> np.ndarray:
+    out = np.empty(len(cycles), dtype=float)
+    acc = 0.0
+    k = 0.5 * sd
+    for i, c in enumerate(cycles):
+        acc = max(0.0, acc + (c - mu) - k)
+        out[i] = acc / sd
+    return out
+
+
+def build_frame(raw: dict, analysis: dict, config: dict = CONFIG) -> dict[str, Any]:
+    """Per (station, vehicle) causal feature matrix, plus labels where available."""
+    stations = raw["stations"]
+    count = raw.get("vehicle_count") or max(o["vehicle"] for o in raw["operations"])
+    variants = {v: i for i, v in enumerate(config["product_variants"])}
+    operators = {o: i for i, o in enumerate(config["latent_factors"]["operators"])}
+
+    readings_by_station: dict[str, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+    thermal_by_station: dict[str, dict[int, float]] = defaultdict(dict)
+    for r in raw["readings"]:
+        readings_by_station[r["station"]][r["vehicle"]].append(abs(r["z"]))
+        if r.get("baseline_source") == "physics_model_residual":
+            thermal_by_station[r["station"]][r["vehicle"]] = abs(r["z"])
+
+    ops_by_station: dict[str, dict[int, dict]] = defaultdict(dict)
+    for o in raw["operations"]:
+        ops_by_station[o["station"]][o["vehicle"]] = o
+
+    alerts_by_station: dict[str, np.ndarray] = {}
+    warns_by_station: dict[str, np.ndarray] = {}
+    for s in stations:
+        alerts_by_station[s["id"]] = np.zeros(count + 1)
+        warns_by_station[s["id"]] = np.zeros(count + 1)
+    for f in analysis["flags"]:
+        arr = alerts_by_station if f.get("severity") == "alert" else warns_by_station
+        if f["station"] in arr and 0 <= f["detected_at"] <= count:
+            arr[f["station"]][f["detected_at"]] += 1
+
+    # Ground-truth labels: a fault confirmed at this station within the next H vehicles.
+    label_map: dict[str, set[int]] = defaultdict(set)
+    paint_ids = [s["id"] for s in stations if s["area"] == "Paint"]
+    for g in raw.get("ground_truth", []):
+        targets = paint_ids if str(g["station"]).endswith("-*") else [g["station"]]
+        for t in targets:
+            label_map[t].add(g["vehicle"])
+
+    lot_z: dict[str, list[float]] = defaultdict(list)
+    for r in raw["readings"]:
+        lot_z[r.get("supplier_lot", "NA")].append(abs(r["z"]))
+    lot_mean = {k: float(np.mean(v)) for k, v in lot_z.items()}
+
+    rows, meta, labels = [], [], []
+    station_index = {s["id"]: i for i, s in enumerate(stations)}
+
     for s in stations:
         sid = s["id"]
-        s_flags = [f for f in current_flags if f["station"] == sid]
-        s_bns = [b for b in current_bottlenecks if b["station"] == sid]
-        
-        base_risk = 4.0
-        primary_driver = "Nominal operating variance"
-        
-        if any(f["severity"] == "alert" for f in s_flags):
-            base_risk = max(base_risk, 84.0)
-            primary_driver = f"Critical SPC breach ({s_flags[-1].get('parameter', 'multi-signal')})"
-        elif any(f["severity"] == "warning" for f in s_flags):
-            base_risk = max(base_risk, 62.0)
-            primary_driver = f"Parameter micro-drift ({s_flags[-1].get('parameter', 'trend')})"
-            
-        if s_bns:
-            base_risk = max(base_risk, 89.0)
-            primary_driver = "Cycle time blowout (Bottleneck starving downstream)"
-            
-        if not s["instrumented"]:
-            ops = [x for x in raw.get("operations", []) if x["station"] == sid]
-            gap_tag = s.get("gap_method", "manual checklist")
-            if ops and ops[-1].get("manual_outcome") in {"fail", "rework"}:
-                base_risk = max(base_risk, 78.0)
-                primary_driver = f"Manual QA checklist failure ({gap_tag})"
-            elif any(f["severity"] == "alert" for f in s_flags):
-                base_risk = max(base_risk, 66.0)
-                primary_driver = "Adjacent station defect propagation"
-                
-        station_risks[sid] = {
-            "defect_risk_pct": round(float(base_risk), 1),
-            "primary_driver": primary_driver,
-            "confidence_pct": 94.2 if s["instrumented"] else 76.0,
-            "recommended_action": (
-                "Schedule tool recalibration during next maintenance window" if "drift" in primary_driver.lower()
-                else "Inspect weld/torque joint & isolate part" if "breach" in primary_driver.lower()
-                else "Rebalance buffer queue & inspect station pacing" if "bottleneck" in primary_driver.lower()
-                else "Routine monitoring"
-            )
-        }
-    return station_risks
+        vehicles = np.arange(1, count + 1)
+        zmax = np.array([max(readings_by_station[sid].get(v, [0.0])) for v in vehicles])
+        zmean = np.array([float(np.mean(readings_by_station[sid].get(v, [0.0]))) for v in vehicles])
+        therm = np.array([thermal_by_station[sid].get(v, 0.0) for v in vehicles])
 
-_TRAINED_MODEL = None
-_MODEL_NAME = "Gradient-Boosted Trees (AI4I 2020 Industrial Prior)"
-_FEATURE_IMPORTANCES = {}
+        cycles = np.array([ops_by_station[sid].get(v, {}).get("cycle_time", 0.0) for v in vehicles])
+        queues = np.array([ops_by_station[sid].get(v, {}).get("queue", 0.0) for v in vehicles])
+        utils = np.array([ops_by_station[sid].get(v, {}).get("utilization", 0.0) for v in vehicles])
+        rework = np.array([1.0 if ops_by_station[sid].get(v, {}).get("manual_outcome") in {"fail", "rework"}
+                           else 0.0 for v in vehicles])
 
-def init_model():
-    global _TRAINED_MODEL, _MODEL_NAME, _FEATURE_IMPORTANCES
-    if _TRAINED_MODEL is not None:
-        return _TRAINED_MODEL, _MODEL_NAME, _FEATURE_IMPORTANCES
-        
-    X_train, y_train = _generate_industrial_training_prior()
-    
-    # Try importing xgboost, with seamless fallback to Native GBDT if memory/import error occurs
+        warm = min(config["thresholds"]["baseline_warmup_vehicles"], count // 2)
+        mu_c, sd_c = float(np.mean(cycles[:warm])), max(float(np.std(cycles[:warm], ddof=1)), 1e-6)
+        mu_q, sd_q = float(np.mean(queues[:warm])), max(float(np.std(queues[:warm], ddof=1)), 1e-6)
+
+        cycle_z = (cycles - mu_c) / sd_c
+        queue_z = (queues - mu_q) / sd_q
+
+        cusum = _cusum(cycles, mu_c, sd_c)
+        ewma = _ewma_abs(zmean)
+        max10 = _roll_max(zmax, 10)
+        mean10 = _roll_mean(zmean, 10)
+        slope10 = _roll_slope(zmean, 10)
+        alerts20 = _roll_sum(alerts_by_station[sid][1:count + 1], 20)
+        warns20 = _roll_sum(warns_by_station[sid][1:count + 1], 20)
+        rework20 = _roll_sum(rework, 20)
+
+        idx = station_index[sid]
+        up_ids = [stations[j]["id"] for j in range(max(0, idx - 3), idx)]
+        up_alerts = np.sum([alerts_by_station[u][1:count + 1] for u in up_ids], axis=0) \
+            if up_ids else np.zeros(count)
+        up20 = _roll_sum(up_alerts, 20)
+
+        since = np.zeros(count)
+        last = -999
+        for i in range(count):
+            if alerts_by_station[sid][i + 1] > 0:
+                last = i
+            since[i] = min(i - last, 200) if last >= 0 else 200
+
+        for i, v in enumerate(vehicles):
+            op = ops_by_station[sid].get(v, {})
+            rows.append([
+                max10[i], mean10[i], ewma[i], slope10[i],
+                alerts20[i], warns20[i], since[i],
+                cycle_z[i], cusum[i], queue_z[i], utils[i],
+                up20[i], therm[i],
+                rework20[i],
+                float(operators.get(op.get("operator"), 0)),
+                lot_mean.get(op.get("supplier_lot", "NA"), 0.0),
+                float(variants.get(op.get("variant"), 0)),
+            ])
+            meta.append((sid, int(v)))
+            future = label_map.get(sid, ())
+            labels.append(1 if any(v < g <= v + HORIZON for g in future) else 0)
+
+    return {"X": np.asarray(rows, dtype=float), "y": np.asarray(labels, dtype=int),
+            "meta": meta, "vehicle_count": count}
+
+
+# --------------------------------------------------------------------------
+# Training
+# --------------------------------------------------------------------------
+
+def _randomised_config(seed: int, base: dict = CONFIG) -> dict:
+    """A structurally identical line with different faults, so the model learns fault
+    *signatures* rather than which station happens to be broken in the demo."""
+    rng = np.random.default_rng(seed)
+    cfg = copy.deepcopy(base)
+    stations = [f"{g['prefix']}-{n:02}" for g in cfg["station_groups"]
+                for n in range(1, g["count"] + 1)]
+    instrumented = []
+    for g in cfg["station_groups"]:
+        manual = round(g["count"] * (1 - g["instrumented_ratio"]))
+        instrumented += [f"{g['prefix']}-{n:02}" for n in range(manual + 1, g["count"] + 1)]
+
+    injections = []
+    for k in range(int(rng.integers(2, 5))):
+        kind = str(rng.choice(["trend", "point", "cross_parameter", "bottleneck"]))
+        start = int(rng.integers(215, 360))
+        if kind == "bottleneck":
+            injections.append({"id": f"r{k}", "kind": "bottleneck",
+                               "station": str(rng.choice(stations)),
+                               "start_vehicle": start, "end_vehicle": cfg["line"]["vehicle_count"],
+                               "cycle_slope": float(rng.uniform(0.10, 0.28))})
+            continue
+        sid = str(rng.choice(instrumented))
+        params = [p for g in cfg["station_groups"] if sid.startswith(g["prefix"])
+                  for p in g["parameters"] if g["parameters"][p].get("model") != "thermal_first_order"]
+        if kind == "cross_parameter" and len(params) >= 2:
+            injections.append({"id": f"r{k}", "kind": "cross_parameter", "station": sid,
+                               "parameters": list(rng.choice(params, 2, replace=False)),
+                               "start_vehicle": start, "end_vehicle": start + int(rng.integers(20, 60)),
+                               "shift_std": float(rng.uniform(2.6, 4.2))})
+        elif kind == "point":
+            injections.append({"id": f"r{k}", "kind": "point", "station": sid,
+                               "parameter": str(rng.choice(params)),
+                               "vehicles": list(range(start, start + int(rng.integers(3, 7)))),
+                               "shift_std": float(rng.uniform(3.2, 5.0))})
+        else:
+            injections.append({"id": f"r{k}", "kind": "trend", "station": sid,
+                               "parameter": str(rng.choice(params)),
+                               "start_vehicle": start, "end_vehicle": start + int(rng.integers(50, 120)),
+                               "slope_std_per_vehicle": float(rng.uniform(0.03, 0.09))})
+    cfg["injections"] = injections
+    return cfg
+
+
+def _collect(seeds) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    X, y, groups = [], [], []
+    for seed in seeds:
+        cfg = _randomised_config(seed)
+        raw = simulate(cfg, seed=seed)
+        frame = build_frame(raw, analyze(raw, cfg), cfg)
+        X.append(frame["X"])
+        y.append(frame["y"])
+        groups.append(np.full(len(frame["y"]), seed))
+    return np.vstack(X), np.concatenate(y), np.concatenate(groups)
+
+
+class _Model:
+    """Thin wrapper so the rest of the system does not care which backend trained."""
+
+    def __init__(self):
+        self.backend = "unavailable"
+        self.version = ""
+        self.clf = None
+        self.calibrator = None
+        self.importances: dict[str, float] = {}
+        self.metrics: dict[str, Any] = {}
+        self.base_rate = 0.0
+
+    # -- probability -----------------------------------------------------
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if self.clf is None:
+            return np.zeros(len(X))
+        p = self.clf.predict_proba(X)[:, 1]
+        if self.calibrator is not None:
+            p = self.calibrator.predict(p)
+        return np.clip(p, 0.0, 1.0)
+
+    # -- attribution -----------------------------------------------------
+    def contributions(self, X: np.ndarray) -> np.ndarray | None:
+        """Exact TreeSHAP contributions in log-odds space, or None if unavailable."""
+        if self.backend != "xgboost" or self.clf is None:
+            return None
+        import xgboost as xgb
+        booster = self.clf.get_booster()
+        return booster.predict(xgb.DMatrix(X, feature_names=FEATURES), pred_contribs=True)
+
+
+def train() -> _Model:
+    model = _Model()
+    X_tr, y_tr, _ = _collect(TRAIN_SEEDS)
+    X_cal, y_cal, _ = _collect(CAL_SEEDS)
+    X_va, y_va, _ = _collect(VAL_SEEDS)
+    model.base_rate = float(y_va.mean())
+
     try:
         import xgboost as xgb
         clf = xgb.XGBClassifier(
-            n_estimators=45,
-            max_depth=3,
-            learning_rate=0.08,
-            subsample=0.85,
-            colsample_bytree=0.9,
-            eval_metric="logloss",
-            random_state=42
+            n_estimators=220, max_depth=4, learning_rate=0.06,
+            subsample=0.85, colsample_bytree=0.85, min_child_weight=6,
+            reg_lambda=1.5, eval_metric="logloss", random_state=42, n_jobs=4,
         )
-        clf.fit(X_train, y_train)
-        _TRAINED_MODEL = clf
-        _MODEL_NAME = "XGBoost 3.2 (AI4I 2020 Industrial Prior)"
-        raw_imp = clf.feature_importances_
-        tot = sum(raw_imp)
-        _FEATURE_IMPORTANCES = {feat: round(float(imp / tot * 100), 1) for feat, imp in zip(FEATURES, raw_imp)}
+        clf.fit(X_tr, y_tr)
+        model.clf, model.backend, model.version = clf, "xgboost", xgb.__version__
+        gains = np.asarray(clf.feature_importances_, dtype=float)
     except Exception:
-        clf = NativeGradientBoostedClassifier(n_estimators=35, learning_rate=0.12)
-        clf.fit(X_train, y_train)
-        _TRAINED_MODEL = clf
-        _MODEL_NAME = "Gradient-Boosted Trees (AI4I 2020 Industrial Prior)"
-        raw_imp = clf.feature_importances_
-        tot = sum(raw_imp)
-        _FEATURE_IMPORTANCES = {feat: round(float(imp / tot * 100), 1) for feat, imp in zip(FEATURES, raw_imp)}
-        
-    return _TRAINED_MODEL, _MODEL_NAME, _FEATURE_IMPORTANCES
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        import sklearn
+        clf = HistGradientBoostingClassifier(max_depth=4, learning_rate=0.06,
+                                             max_iter=220, random_state=42)
+        clf.fit(X_tr, y_tr)
+        model.clf, model.backend, model.version = clf, "sklearn", sklearn.__version__
+        gains = np.ones(len(FEATURES))
 
-def train_and_score(raw: dict, analysis: dict) -> dict[str, Any]:
-    """Score telemetry features using the industrial GBDT/XGBoost model."""
-    model, model_name, importances = init_model()
-    X, vehicles, meta = extract_features(raw, analysis)
-    
-    probabilities = model.predict_proba(X)[:, 1]
-    scores = {vehicle: round(float(prob * 100), 1) for vehicle, prob in zip(vehicles, probabilities)}
-    station_risks = compute_station_risk_matrix(raw, analysis, scores)
-    
+    # Calibrate on the validation lines so a reported percentage is a frequency.
+    try:
+        from sklearn.isotonic import IsotonicRegression
+        # Fitted on the calibration lines only. Scoring calibration on the same rows
+        # it was fitted to would make any reliability diagram look perfect by
+        # construction; the reported one comes from a third, untouched set of lines.
+        raw_p = model.clf.predict_proba(X_cal)[:, 1]
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        iso.fit(raw_p, y_cal)
+        model.calibrator = iso
+    except Exception:
+        model.calibrator = None
+
+    total = float(gains.sum()) or 1.0
+    model.importances = {f: round(float(g) / total * 100.0, 1) for f, g in zip(FEATURES, gains)}
+    model.metrics = _evaluate(model, X_va, y_va)
+    return model
+
+
+def _evaluate(model: _Model, X: np.ndarray, y: np.ndarray) -> dict[str, Any]:
+    """Held-out metrics. PR-AUC is reported against its no-skill baseline because on a
+    class this rare an ROC-AUC reads impressively high for a useless model."""
+    p = model.predict(X)
+    out: dict[str, Any] = {
+        "held_out_rows": int(len(y)),
+        "positive_rate_pct": round(100.0 * float(y.mean()), 2),
+        "brier_score": round(float(np.mean((p - y) ** 2)), 4),
+    }
+    try:
+        from sklearn.metrics import average_precision_score, roc_auc_score
+        out["pr_auc"] = round(float(average_precision_score(y, p)), 3)
+        out["pr_auc_baseline"] = round(float(y.mean()), 3)
+        out["roc_auc"] = round(float(roc_auc_score(y, p)), 3)
+        out["lift_over_baseline"] = round(out["pr_auc"] / max(out["pr_auc_baseline"], 1e-9), 1)
+    except Exception:
+        pass
+
+    order = np.argsort(-p)
+    for k in (40, 120):
+        if len(order) >= k:
+            out[f"precision_at_{k}"] = round(float(y[order[:k]].mean()), 3)
+
+    # Reliability: mean predicted vs observed frequency per decile.
+    bins = np.clip((p * 10).astype(int), 0, 9)
+    curve = []
+    for b in range(10):
+        mask = bins == b
+        if mask.sum() >= 25:
+            curve.append({"bin": b / 10.0,
+                          "predicted": round(float(p[mask].mean()), 3),
+                          "observed": round(float(y[mask].mean()), 3),
+                          "n": int(mask.sum())})
+    out["reliability"] = curve
+    return out
+
+
+# --------------------------------------------------------------------------
+# Scoring
+# --------------------------------------------------------------------------
+
+_MODEL: _Model | None = None
+CACHE_DIR = Path(__file__).parent / ".cache"
+
+
+def _cache_key() -> str:
+    """Cache is keyed on everything that changes the model: the config that generates
+    the training lines, the feature set, and the seed ranges."""
+    payload = repr((CONFIG, FEATURES, list(TRAIN_SEEDS), list(CAL_SEEDS),
+                    list(VAL_SEEDS), HORIZON)).encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def get_model(use_cache: bool = True) -> _Model:
+    global _MODEL
+    if _MODEL is not None:
+        return _MODEL
+    path = CACHE_DIR / f"risk_model_{_cache_key()}.pkl"
+    if use_cache and path.exists():
+        try:
+            _MODEL = pickle.loads(path.read_bytes())
+            return _MODEL
+        except Exception:
+            pass
+    _MODEL = train()
+    if use_cache:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            for stale in CACHE_DIR.glob("risk_model_*.pkl"):
+                stale.unlink()
+            path.write_bytes(pickle.dumps(_MODEL))
+        except Exception:
+            pass
+    return _MODEL
+
+
+def score(raw: dict, analysis: dict, config: dict = CONFIG) -> dict[str, Any]:
+    """Score every (station, vehicle) cell and attach per-prediction attribution."""
+    model = get_model()
+    frame = build_frame(raw, analysis, config)
+    X, meta = frame["X"], frame["meta"]
+    probs = model.predict(X) * 100.0
+    contribs = model.contributions(X)
+
+    by_station: dict[str, dict[int, float]] = defaultdict(dict)
+    drivers: dict[str, dict[int, list]] = defaultdict(dict)
+    for i, (sid, v) in enumerate(meta):
+        by_station[sid][v] = round(float(probs[i]), 1)
+        if contribs is not None:
+            row = contribs[i][:len(FEATURES)]
+            top = np.argsort(-np.abs(row))[:3]
+            drivers[sid][v] = [
+                {"feature": FEATURES[j], "label": FEATURE_LABELS[FEATURES[j]],
+                 "family": CAUSE_FAMILY[FEATURES[j]],
+                 "contribution": round(float(row[j]), 3)}
+                for j in top if abs(row[j]) > 1e-6
+            ]
+
     return {
         "available": True,
-        "model": model_name,
-        "target": "Defect & Starvation Risk within next 8 vehicles (P_defect)",
-        "training_provenance": "Pre-trained on AI4I 2020 multi-mode industrial failure benchmark (tool wear, thermal drift, overstrain, SPC flags)",
-        "feature_importances": importances,
-        "scores": scores,
-        "station_risks": station_risks,
-        "summary": {
-            "mean_risk_pct": round(float(np.mean(list(scores.values()))), 1),
-            "high_risk_vehicles_count": sum(1 for s in scores.values() if s >= 35.0),
-            "top_predictive_feature": max(importances.items(), key=lambda x: x[1])[0] if importances else "max_abs_z"
-        }
+        "model": f"XGBoost {model.version}" if model.backend == "xgboost"
+                 else f"scikit-learn HistGradientBoosting {model.version}",
+        "backend": model.backend,
+        "attribution_method": ("Exact TreeSHAP contributions (log-odds)" if contribs is not None
+                               else "Gain-based split importance only"),
+        "target": f"Confirmed incident at this station within the next {HORIZON} vehicles",
+        "training_provenance": (
+            f"Trained on {len(list(TRAIN_SEEDS))} independently generated production lines with "
+            f"randomised fault station, kind, onset and magnitude; calibrated on "
+            f"{len(list(CAL_SEEDS))} further lines, and evaluated on {len(list(VAL_SEEDS))} lines "
+            f"used for neither. Split by line, never by row. "
+            f"The demo line (seed {DEMO_SEED}) appears in no training or calibration set."),
+        "calibration": "Isotonic regression fitted on held-out lines",
+        "feature_importances": model.importances,
+        "feature_labels": FEATURE_LABELS,
+        "validation": model.metrics,
+        "station_scores": {k: dict(v) for k, v in by_station.items()},
+        "station_drivers": {k: dict(v) for k, v in drivers.items()},
+        "horizon_vehicles": HORIZON,
     }

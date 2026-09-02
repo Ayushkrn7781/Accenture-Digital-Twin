@@ -1,4 +1,8 @@
+.cache/
+__pycache__/
+backend/.cache/
 backend/.venv/
 backend/__pycache__/
-frontend/node_modules/
 frontend/dist/
+frontend/node_modules/
+frontend/package-lock.json

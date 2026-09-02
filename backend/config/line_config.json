@@ -1,39 +1,304 @@
 {
-  "line": {"name": "Northstar Mixed-Model Line", "vehicle_count": 420, "scheduled_sensor_change_windows_per_year": 4},
-  "thresholds": {"green_abs_z": 2.0, "alert_abs_z": 3.0, "trend_window": 5, "persistent_window": 4, "bottleneck_window": 8},
-  "product_variants": ["SUV", "Sedan", "EV"],
-  "station_groups": [
-    {"prefix":"BIW","count":14,"area":"Body construction","instrumented_ratio":0.72,"parameters":{"force":{"mean":520,"std":24,"weight":1.1},"torque":{"mean":92,"std":5,"weight":1.0},"vibration":{"mean":3.1,"std":0.35,"weight":0.7}},"cycle_time":58},
-    {"prefix":"PNT","count":10,"area":"Paint","instrumented_ratio":0.70,"parameters":{"temperature":{"mean":178,"std":4,"weight":1.0},"vision_score":{"mean":96,"std":1.5,"weight":1.2},"cycle_time":{"mean":46,"std":4,"weight":0.8}},"cycle_time":48},
-    {"prefix":"FNL","count":16,"area":"Final assembly","instrumented_ratio":0.69,"parameters":{"torque":{"mean":64,"std":4,"weight":1.2},"vision_score":{"mean":97,"std":1.2,"weight":1.0},"cycle_time":{"mean":52,"std":5,"weight":0.9}},"cycle_time":52}
+  "line": {
+    "name": "Northstar Mixed-Model Line",
+    "vehicle_count": 420,
+    "scheduled_sensor_change_windows_per_year": 4,
+    "vehicles_per_shift": 30,
+    "shifts_per_week": 10
+  },
+  "thresholds": {
+    "green_abs_z": 2.0,
+    "alert_abs_z": 3.0,
+    "trend_window": 5,
+    "baseline_warmup_vehicles": 200,
+    "cross_param_abs_z": 2.5,
+    "cross_param_min_corr": 0.35,
+    "ewma_lambda": 0.2,
+    "ewma_L": 4.5,
+    "release_fraction": 0.4,
+    "trace_detrend_window": 61,
+    "trace_exclude_parameters": [
+      "cycle_time"
+    ]
+  },
+  "bottleneck": {
+    "_comment": "Values under `calibrated` are written by calibrate.py against fault-free runs. Do not hand-edit.",
+    "slope_window": 24,
+    "slope_t_crit": 3.5,
+    "cusum_k_sigma": 0.5,
+    "cusum_h_sigma": 7.75,
+    "queue_z_crit": 3.0,
+    "release_fraction": 0.4,
+    "calibrated": {
+      "method": "Threshold sweep against injection-free simulated lines; every alarm raised on those runs is a false alarm by construction.",
+      "seeds": 14,
+      "validation_seeds": 7,
+      "vehicles_per_run": 420,
+      "budget_false_alarms_per_run": 1.0,
+      "ewma_L": 4.5,
+      "cusum_h_sigma": 7.75,
+      "tau_fit_z_crit": 3.3,
+      "measured_false_alarms_per_run_heldout": {
+        "anomaly": 0.286,
+        "bottleneck": 0.286,
+        "physics": 0.286,
+        "total": 0.857
+      },
+      "arl0_vehicles": 490.0,
+      "calibrated_on": "2026-09-02"
+    }
+  },
+  "product_variants": [
+    "SUV",
+    "Sedan",
+    "EV"
   ],
+  "station_groups": [
+    {
+      "prefix": "BIW",
+      "count": 14,
+      "area": "Body construction",
+      "instrumented_ratio": 0.72,
+      "parameters": {
+        "force": {
+          "mean": 520,
+          "std": 24,
+          "weight": 1.1
+        },
+        "torque": {
+          "mean": 92,
+          "std": 5,
+          "weight": 1.0
+        },
+        "vibration": {
+          "mean": 3.1,
+          "std": 0.35,
+          "weight": 0.7
+        }
+      },
+      "cycle_time": 58
+    },
+    {
+      "prefix": "PNT",
+      "count": 10,
+      "area": "Paint",
+      "instrumented_ratio": 0.7,
+      "parameters": {
+        "temperature": {
+          "mean": 170,
+          "std": 1.5,
+          "weight": 1.0,
+          "model": "thermal_first_order"
+        },
+        "vision_score": {
+          "mean": 96,
+          "std": 1.5,
+          "weight": 1.2
+        },
+        "cycle_time": {
+          "mean": 46,
+          "std": 4,
+          "weight": 0.8
+        }
+      },
+      "cycle_time": 48
+    },
+    {
+      "prefix": "FNL",
+      "count": 16,
+      "area": "Final assembly",
+      "instrumented_ratio": 0.69,
+      "parameters": {
+        "torque": {
+          "mean": 64,
+          "std": 4,
+          "weight": 1.2
+        },
+        "vision_score": {
+          "mean": 97,
+          "std": 1.2,
+          "weight": 1.0
+        },
+        "cycle_time": {
+          "mean": 52,
+          "std": 5,
+          "weight": 0.9
+        }
+      },
+      "cycle_time": 52
+    }
+  ],
+  "inspection_station": "FNL-16",
+  "latent_factors": {
+    "operators": [
+      "OP-1",
+      "OP-2",
+      "OP-3",
+      "OP-4"
+    ],
+    "operator_skill_sigma": 0.35,
+    "supplier_lot_size_vehicles": 30,
+    "supplier_quality_sigma": 0.3,
+    "ambient_swing_C": 3.5,
+    "ambient_period_vehicles": 190,
+    "variant_offset_sigma": 0.6
+  },
   "injections": [
-    {"id":"torque_drift","kind":"trend","station":"FNL-08","parameter":"torque","start_vehicle":125,"end_vehicle":210,"slope_std_per_vehicle":0.055},
-    {"id":"paint_heat_shift","kind":"point","station":"PNT-04","parameter":"temperature","vehicles":[180,181,182],"shift_std":4.2},
-    {"id":"body_cross_fault","kind":"cross_parameter","station":"BIW-06","parameters":["force","vibration"],"start_vehicle":245,"end_vehicle":270,"shift_std":3.4},
-    {"id":"paint_bottleneck","kind":"bottleneck","station":"PNT-08","start_vehicle":220,"end_vehicle":420,"cycle_slope":0.16},
-    {"id":"final_bottleneck","kind":"bottleneck","station":"FNL-13","start_vehicle":300,"end_vehicle":420,"cycle_slope":0.19}
+    {
+      "id": "torque_drift",
+      "kind": "trend",
+      "station": "FNL-08",
+      "parameter": "torque",
+      "start_vehicle": 215,
+      "end_vehicle": 300,
+      "slope_std_per_vehicle": 0.055
+    },
+    {
+      "id": "paint_heat_shift",
+      "kind": "point",
+      "station": "PNT-04",
+      "parameter": "temperature",
+      "vehicles": [
+        250,
+        251,
+        252
+      ],
+      "shift_std": 4.2
+    },
+    {
+      "id": "body_cross_fault",
+      "kind": "cross_parameter",
+      "station": "BIW-06",
+      "parameters": [
+        "force",
+        "vibration"
+      ],
+      "start_vehicle": 265,
+      "end_vehicle": 290,
+      "shift_std": 3.4
+    },
+    {
+      "id": "paint_bottleneck",
+      "kind": "bottleneck",
+      "station": "PNT-08",
+      "start_vehicle": 230,
+      "end_vehicle": 420,
+      "cycle_slope": 0.16
+    },
+    {
+      "id": "final_bottleneck",
+      "kind": "bottleneck",
+      "station": "FNL-13",
+      "start_vehicle": 310,
+      "end_vehicle": 420,
+      "cycle_slope": 0.19
+    },
+    {
+      "id": "oven_fouling",
+      "kind": "thermal_tau_drift",
+      "station": "PNT-*",
+      "start_vehicle": 240,
+      "end_vehicle": 350,
+      "tau_end_s": 44.2
+    },
+    {
+      "id": "latent_weld_defect",
+      "kind": "latent_defect",
+      "station": "BIW-09",
+      "parameter": "force",
+      "inspection_station": "FNL-16",
+      "start_vehicle": 300,
+      "end_vehicle": 405,
+      "shift_std": 0.6,
+      "surface_probability": 0.8,
+      "surface_lag_vehicles": 0
+    }
   ],
   "physics": {
-    "paint_oven_setpoint_K": 178,
-    "ambient_K": 25,
-    "cooling_constant": 0.04,
-    "max_deviation_from_model_K": 12.0
+    "paint_oven": {
+      "setpoint_C": 178.0,
+      "ambient_C": 25.0,
+      "tau_s": 42.0,
+      "dwell_base_s": 25.0,
+      "dwell_step_s": 19.0,
+      "measurement_sigma_C": 1.0
+    },
+    "tau_fit_z_crit": 3.3,
+    "tau_fit_window_vehicles": 15
   },
   "sensor_retrofit_plan": [
-    {"target_stations": ["BIW-01","BIW-02","BIW-03","BIW-04"], "sensor_type": "Wireless vibration puck (MEMS)", "unit_cost_usd": 220, "install_window": "Q1 maintenance", "benefit": "Detect weld-gun bearing degradation 3-5 shifts before failure"},
-    {"target_stations": ["PNT-01","PNT-02","PNT-03"], "sensor_type": "IR pyrometer (non-contact)", "unit_cost_usd": 310, "install_window": "Q2 maintenance", "benefit": "Continuous oven zone profiling replacing manual thermocouple checks"},
-    {"target_stations": ["FNL-01","FNL-02","FNL-03","FNL-04","FNL-05"], "sensor_type": "Clamp-on current transformer", "unit_cost_usd": 150, "install_window": "Q3 maintenance", "benefit": "Motor load signature analysis without rewiring torque tool circuits"},
-    {"target_stations": ["BIW-01","BIW-02","FNL-01","FNL-02"], "sensor_type": "Ultrasonic acoustic emission", "unit_cost_usd": 480, "install_window": "Q4 maintenance", "benefit": "Crack propagation and weld integrity without destructive testing"}
+    {
+      "target_stations": [
+        "BIW-01",
+        "BIW-02",
+        "BIW-03",
+        "BIW-04"
+      ],
+      "sensor_type": "Wireless vibration puck (MEMS)",
+      "unit_cost_usd": 220,
+      "install_window": "Q1 maintenance",
+      "benefit": "Detect weld-gun bearing degradation 3-5 shifts before failure"
+    },
+    {
+      "target_stations": [
+        "PNT-01",
+        "PNT-02",
+        "PNT-03"
+      ],
+      "sensor_type": "IR pyrometer (non-contact)",
+      "unit_cost_usd": 310,
+      "install_window": "Q2 maintenance",
+      "benefit": "Continuous oven zone profiling replacing manual thermocouple checks"
+    },
+    {
+      "target_stations": [
+        "FNL-01",
+        "FNL-02",
+        "FNL-03",
+        "FNL-04",
+        "FNL-05"
+      ],
+      "sensor_type": "Clamp-on current transformer",
+      "unit_cost_usd": 150,
+      "install_window": "Q3 maintenance",
+      "benefit": "Motor load signature analysis without rewiring torque tool circuits"
+    },
+    {
+      "target_stations": [
+        "BIW-01",
+        "BIW-02",
+        "FNL-01",
+        "FNL-02"
+      ],
+      "sensor_type": "Ultrasonic acoustic emission",
+      "unit_cost_usd": 480,
+      "install_window": "Q4 maintenance",
+      "benefit": "Crack propagation and weld integrity without destructive testing"
+    }
   ],
   "scalability": {
     "config_abstraction": "Each plant supplies a line_config.json defining its station topology, sensor coverage, parameter baselines, and thresholds. No code changes required.",
     "deployment_model": "Containerised FastAPI + React bundle. Reads OT historian via read-only SQL/OPC-UA adapter.",
     "estimated_onboarding_weeks": 6,
     "rollout_phases": [
-      {"phase": 1, "scope": "Single pilot line", "duration_weeks": 6, "cost_estimate_usd": 35000},
-      {"phase": 2, "scope": "All lines at pilot plant", "duration_weeks": 4, "cost_estimate_usd": 20000},
-      {"phase": 3, "scope": "Cross-plant deployment", "duration_weeks": 8, "cost_estimate_usd": 55000}
+      {
+        "phase": 1,
+        "scope": "Single pilot line",
+        "duration_weeks": 6,
+        "cost_estimate_usd": 35000
+      },
+      {
+        "phase": 2,
+        "scope": "All lines at pilot plant",
+        "duration_weeks": 4,
+        "cost_estimate_usd": 20000
+      },
+      {
+        "phase": 3,
+        "scope": "Cross-plant deployment",
+        "duration_weeks": 8,
+        "cost_estimate_usd": 55000
+      }
     ]
   }
 }
